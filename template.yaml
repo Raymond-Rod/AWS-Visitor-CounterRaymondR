@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Student demo - S3 visitor counter with HTTP API, Lambda and DynamoDB.
+# Upload index.html separately after deployment, using the CounterApiUrl output.
+# Counts page loads, not unique people. The public API has no authentication.
+# S3 website hosting uses HTTP. Add CloudFront for HTTPS in a future version.
+# Account-level S3 Block Public Access may prevent the public index.html policy.
+# Empty the website bucket before deleting the stack.
+
+Resources:
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: aws-visitor-counter-websitebucket-rayr
+      WebsiteConfiguration:
+        IndexDocument: index.html
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  WebsitePolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadOnlyHomepage
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${WebsiteBucket.Arn}/index.html'
+
+  CounterTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: AWS-Visitor-Counter-CounterTable-rayr
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: UpdateCounterAndWriteLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt CounterTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt FunctionLogs.Arn
+
+  FunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  CounterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt FunctionRole.Arn
+      MemorySize: 128
+      Timeout: 10
+      LoggingConfig:
+        LogGroup: !Ref FunctionLogs
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref CounterTable
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import os
+          import boto3
+
+          table = boto3.resource('dynamodb').Table(os.environ['TABLE_NAME'])
+
+          def handler(event, context):
+              try:
+                  result = table.update_item(
+                      Key={'id': 'homepage'},
+                      UpdateExpression='ADD #visits :one',
+                      ExpressionAttributeNames={'#visits': 'visits'},
+                      ExpressionAttributeValues={':one': 1},
+                      ReturnValues='UPDATED_NEW'
+                  )
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Cache-Control': 'no-store'
+                      },
+                      'body': json.dumps({'count': int(result['Attributes']['visits'])})
+                  }
+              except Exception:
+                  logging.exception('Counter update failed')
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': 'Unable to update counter'})
+                  }
+
+  CounterApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !GetAtt WebsiteBucket.WebsiteURL
+        AllowMethods:
+          - POST
+        AllowHeaders:
+          - content-type
+        MaxAge: 300
+
+  CounterIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref CounterApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CounterFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 10000
+
+  CounterRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref CounterApi
+      RouteKey: POST /count
+      AuthorizationType: NONE
+      Target: !Join ['/', ['integrations', !Ref CounterIntegration]]
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref CounterApi
+      StageName: '$default'
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 10
+        ThrottlingRateLimit: 5
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CounterFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${CounterApi}/*/POST/count'
+
+Outputs:
+  WebsiteBucketName:
+    Description: Upload your index.html file into this bucket.
+    Value: !Ref WebsiteBucket
+  WebsiteURL:
+    Description: Open after uploading index.html. This demo website uses HTTP.
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+  CounterApiUrl:
+    Description: Set this URL in index.html; requests must use POST.
+    Value: !Sub '${CounterApi.ApiEndpoint}/count'
+  TableName:
+    Description: DynamoDB table for checking the stored counter.
+    Value: !Ref CounterTable
